@@ -11,7 +11,7 @@ jobs:
   unit_tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: ShellCheck all shell scripts and tests
         run: |
@@ -95,7 +95,7 @@ jobs:
               ;;
           esac
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Run jemalloc action (1st invocation)
         id: jemalloc
@@ -166,7 +166,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Run jemalloc action
         id: jemalloc
@@ -208,7 +208,7 @@ jobs:
           # - { runner: macos-13, arch: x64 }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7.0.1
 
       - name: Run jemalloc action
         id: jemalloc
