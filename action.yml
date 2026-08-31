@@ -1,128 +1,318 @@
 # action.yml
 name: "setup-jemalloc"
-description: "An action to download, install, and cache jemalloc on Linux, macOS, and Windows runners"
+description: "Download, build, and cache jemalloc on Linux (transparent LD_PRELOAD), macOS (dyld interposer via DYLD_INSERT_LIBRARIES), and Windows (Detours-injected jemalloc-run launcher)."
 author: "Jason Pearson"
 inputs:
   jemalloc-version:
     description: "Version of jemalloc to use"
-    required: "true"
+    # Not required: it has a default, so callers may omit it.
+    required: false
     default: "5.3.0"
-outputs: {}
+  jemalloc-sha256:
+    description: "Optional SHA-256 of the jemalloc tarball. Overrides the built-in checksum and lets you pin a version that has no baked-in value. When empty and the version is unknown, the integrity check is skipped with a warning."
+    required: false
+    default: ""
+outputs:
+  cache-hit:
+    description: "Whether the jemalloc library was restored from cache ('true'/'false'; empty on unsupported runners)."
+    value: ${{ steps.config.outputs.cache-hit || steps.config-win.outputs.cache-hit || steps.config-mac.outputs.cache-hit }}
+  library-path:
+    description: "Absolute path to the built jemalloc library (libjemalloc.so.2 on Linux, jemalloc.dll on Windows, libjemalloc.2.dylib on macOS; empty on unsupported runners)."
+    value: ${{ steps.config.outputs.library-path || steps.config-win.outputs.library-path || steps.config-mac.outputs.library-path }}
+  ld-preload:
+    description: "The LD_PRELOAD value the action set (Linux only; empty elsewhere)."
+    value: ${{ steps.config.outputs.ld-preload }}
+  jemalloc-run:
+    description: "Windows only: path to jemalloc-run.exe, the launcher that runs a command with jemalloc injected (there is no transparent preload on Windows). Empty on other OSes."
+    value: ${{ steps.config-win.outputs.jemalloc-run }}
+  interpose-dylib:
+    description: "macOS only: path to the jemalloc dyld interposer dylib. Wrap a command with DYLD_INSERT_LIBRARIES=<this> to run it with jemalloc (the action does not insert it globally). Empty on other OSes."
+    value: ${{ steps.config-mac.outputs.interpose-dylib }}
 
+# Linux uses transparent LD_PRELOAD; Windows has no preload equivalent, so it
+# builds a Detours-based launcher (jemalloc-run.exe) that injects jemalloc into
+# a wrapped command (see README + issue #28). macOS is unsupported; scripts/mac/
+# is kept (and unit-tested) as scaffolding for future macOS work. Every step is
+# gated by runner.os, so the action is a graceful no-op on unsupported runners.
 runs:
   using: "composite"
   steps:
 
+    - name: "Detect platform"
+      if: runner.os == 'Linux'
+      id: platform
+      shell: bash
+      run: |
+        # Discriminate the cache by distro+version so a library built on one
+        # distro/libc (e.g. musl on Alpine, or a newer glibc) is never restored
+        # into an incompatible one. Fall back to a libc tag, then 'unknown'.
+        plat=""
+        if [ -r /etc/os-release ]; then
+          . /etc/os-release
+          plat="${ID:-}-${VERSION_ID:-}"
+        fi
+        if [ -z "$plat" ] || [ "$plat" = "-" ]; then
+          if ls /lib/ld-musl-* >/dev/null 2>&1; then plat="musl"; else plat="glibc"; fi
+        fi
+        # Sanitize to a safe cache-key segment.
+        plat="$(printf '%s' "$plat" | tr -c 'A-Za-z0-9._-' '_')"
+        echo "tag=$plat" >> "$GITHUB_OUTPUT"
+        echo "Platform cache tag: $plat"
+
+    - name: "Resolve action path"
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        # In container jobs GitHub leaves github.action_path as a host path
+        # (/home/runner/work/...) even though the work dir is mounted at /__w,
+        # so scripts referenced by that path are "not found" inside the
+        # container. Remap the runner work-dir prefix to the mount when the
+        # original path doesn't resolve; a no-op on normal (non-container) runs.
+        ap="$GITHUB_ACTION_PATH"
+        if [ ! -e "$ap/scripts/linux/checksums.sh" ] && \
+           [ -e "/__w/${ap#*/work/}/scripts/linux/checksums.sh" ]; then
+          ap="/__w/${ap#*/work/}"
+        fi
+        echo "JEMALLOC_ACTION_PATH=$ap" >> "$GITHUB_ENV"
+
     - name: "Restore jemalloc"
       if: runner.os == 'Linux'
       id: cache-jemalloc
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@v6
       with:
-        path: ${{ runner.os == 'Windows' && '/tmp/libjemalloc.dll' || runner.os == 'Linux' && '/tmp/libjemalloc.so.2' || '/tmp/libjemalloc.2.dylib' }}
-        key: v7-${{ runner.os }}-jemalloc-${{ inputs.jemalloc-version }}
+        path: /tmp/libjemalloc.so.2
+        key: v9-${{ runner.os }}-${{ runner.arch }}-${{ steps.platform.outputs.tag }}-jemalloc-${{ inputs.jemalloc-version }}
 
     - name: "Relocate jemalloc to expected directory"
       if: ${{ runner.os == 'Linux' && steps.cache-jemalloc.outputs.cache-hit == 'true' }}
       shell: bash
       run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          mkdir -p /usr/local/lib
-          sudo cp /tmp/libjemalloc.so.2 /usr/local/lib/
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          sudo mkdir -p /opt/homebrew/Cellar/jemalloc/5.3.0/lib
-          sudo cp /tmp/libjemalloc.2.dylib /opt/homebrew/Cellar/jemalloc/5.3.0/lib/
-        elif [ "${{ runner.os }}" == "Windows" ]; then
-          mkdir -p "$RUNNER_TEMP/jemalloc"
-          cp /tmp/libjemalloc.dll "$RUNNER_TEMP/jemalloc/jemalloc.dll"
-        fi
+        # Atomic, idempotent install so a second in-job invocation cannot
+        # truncate an LD_PRELOAD'd library in place and crash the copy with
+        # SIGSEGV (issue #5).
+        bash "$JEMALLOC_ACTION_PATH/scripts/linux/relocate.sh" /tmp/libjemalloc.so.2 /usr/local/lib/libjemalloc.so.2
 
     - name: "Download jemalloc"
       if: ${{ runner.os == 'Linux' && steps.cache-jemalloc.outputs.cache-hit != 'true' }}
       shell: bash
       run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          curl -Ls https://github.com/jemalloc/jemalloc/releases/download/${{ inputs.jemalloc-version }}/jemalloc-${{ inputs.jemalloc-version }}.tar.bz2 -o jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
-          tar xvf jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          brew install jemalloc --with-lg-page=14 --with-lg-hugepage=14 --host=arm-apple-darwin CFLAGS="-target arm64e-apple-macos" LDFLAGS="-target arm64e-apple-macos" --enable-prof
-          lipo -info /opt/homebrew/Cellar/jemalloc/5.3.0/lib/libjemalloc.2.dylib
-        elif [ "${{ runner.os }}" == "Windows" ]; then
-          curl -Ls https://github.com/jemalloc/jemalloc/releases/download/${{ inputs.jemalloc-version }}/jemalloc-${{ inputs.jemalloc-version }}.tar.bz2 -o jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
-          tar xvf jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
-          # Install MSYS2 for compatible build tools
-          choco install msys2 -y
-          # Add MSYS2 binaries to PATH
-          echo "C:\\tools\\msys64\\usr\\bin" >> $GITHUB_PATH
-          echo "C:\\tools\\msys64\\mingw64\\bin" >> $GITHUB_PATH
-        fi
-
-    - name: "Pacman Tool Setup"
-      if: ${{ runner.os == 'Linux' && steps.cache-jemalloc.outputs.cache-hit != 'true' }}
-      shell: bash
-      run: |
-        if [ "${{ runner.os }}" == "Windows" ]; then
-          # Update package database
-          C:\\tools\\msys64\\usr\\bin\\bash.exe -c "pacman -Sy --noconfirm"
-          # Download packages
-          C:\\tools\\msys64\\usr\\bin\\bash.exe -c "pacman -S --noconfirm mingw-w64-x86_64-gcc mingw-w64-x86_64-make"
-          # Update transitive dependencies if needed
-          C:\\tools\\msys64\\usr\\bin\\bash.exe -c "pacman -Syu --noconfirm"
-        fi
+        curl -fLs https://github.com/jemalloc/jemalloc/releases/download/${{ inputs.jemalloc-version }}/jemalloc-${{ inputs.jemalloc-version }}.tar.bz2 -o jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
+        # Verify the download before it is built and LD_PRELOAD'd (issue #13).
+        bash "$JEMALLOC_ACTION_PATH/scripts/linux/checksums.sh" \
+          jemalloc-${{ inputs.jemalloc-version }}.tar.bz2 \
+          "${{ inputs.jemalloc-version }}" \
+          "${{ inputs.jemalloc-sha256 }}"
+        tar xf jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
 
     - name: "Configure and install jemalloc"
       if: ${{ runner.os == 'Linux' && steps.cache-jemalloc.outputs.cache-hit != 'true' }}
       shell: bash
       run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          cd jemalloc-${{ inputs.jemalloc-version }}
-          # --with-huge-page-size=$(awk '/Hugepagesize:/ {print $2/1024 "MB"}' /proc/meminfo)
-          ./configure
-          make
-          sudo make install
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          echo "brew did the setup already"
-        elif [ "${{ runner.os }}" == "Windows" ]; then
-          cd jemalloc-${{ inputs.jemalloc-version }}
-          export CC=cl; source ../before_install.sh
-          ./configure
-          autoconf
-          mingw32-make -j3
-          mingw32-make -k check
-          cp ./lib/libjemalloc.dll "$RUNNER_TEMP/jemalloc/jemalloc.dll"
-        fi
+        cd jemalloc-${{ inputs.jemalloc-version }}
+        # --with-huge-page-size=$(awk '/Hugepagesize:/ {print $2/1024 "MB"}' /proc/meminfo)
+        # --disable-cxx: the LD_PRELOAD malloc override doesn't need jemalloc's
+        # own operator new/delete (C++ new routes through malloc, which is
+        # replaced), and jemalloc 5.3.0's C++ shim fails to build against very
+        # new libstdc++ (e.g. GCC 15 on Arch: std::__throw_bad_alloc removed).
+        ./configure --disable-cxx
+        make -j"$(nproc)"
+        # Auto-detect sudo: distro containers run as root, often without sudo.
+        if [ "$(id -u)" = "0" ] || ! command -v sudo >/dev/null 2>&1; then SUDO=""; else SUDO="sudo"; fi
+        $SUDO make install
+        # Stage the built library for the cache-save step below.
+        cp /usr/local/lib/libjemalloc.so.2 /tmp/
 
-    - name: "Configure LD_PRELOAD (or equivalent)"
+    - name: "Configure LD_PRELOAD"
       if: runner.os == 'Linux'
+      id: config
       shell: bash
       run: |
-        if [ "${{ runner.os }}" == "Linux" ]; then
-          echo 'LD_PRELOAD=/usr/local/lib/libjemalloc.so.2' >> $GITHUB_ENV
-          mkdir -p /tmp
-          cp /usr/local/lib/libjemalloc.so.2 /tmp/
-        elif [ "${{ runner.os }}" == "macOS" ]; then
-          mkdir -p /tmp
-          cp /opt/homebrew/Cellar/jemalloc/5.3.0/lib/libjemalloc.2.dylib /tmp/
-          echo 'DYLD_FORCE_FLAT_NAMESPACE=1' >> $GITHUB_ENV
-          echo 'DYLD_INSERT_LIBRARIES=/opt/homebrew/Cellar/jemalloc/5.3.0/lib/libjemalloc.2.dylib' >> $GITHUB_ENV
-        elif [ "${{ runner.os }}" == "Windows" ]; then
-          cp "$RUNNER_TEMP/jemalloc/jemalloc.dll" /tmp/
-          echo "$RUNNER_TEMP/jemalloc/jemalloc.dll" >> $GITHUB_PATH
+        lib=/usr/local/lib/libjemalloc.so.2
+        echo "LD_PRELOAD=$lib" >> "$GITHUB_ENV"
+        echo "library-path=$lib" >> "$GITHUB_OUTPUT"
+        echo "ld-preload=$lib" >> "$GITHUB_OUTPUT"
+        # Normalize cache-hit to a definite true/false (the restore step leaves
+        # it empty on a miss with no restore-keys).
+        if [ "${{ steps.cache-jemalloc.outputs.cache-hit }}" = "true" ]; then
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
         fi
 
     - name: "Save jemalloc"
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@v6
       if: ${{ runner.os == 'Linux' && steps.cache-jemalloc.outputs.cache-hit != 'true' }}
       with:
-        path: ${{ runner.os == 'Windows' && '/tmp/libjemalloc.dll' || runner.os == 'Linux' && '/tmp/libjemalloc.so.2' || '/tmp/libjemalloc.2.dylib' }}
-        key: v7-${{ runner.os }}-jemalloc-${{ inputs.jemalloc-version }}
+        path: /tmp/libjemalloc.so.2
+        key: v9-${{ runner.os }}-${{ runner.arch }}-${{ steps.platform.outputs.tag }}-jemalloc-${{ inputs.jemalloc-version }}
 
     - name: "Remove download directory"
       if: ${{ runner.os == 'Linux' && steps.cache-jemalloc.outputs.cache-hit != 'true' }}
       shell: bash
       run: |
         rm -rf jemalloc-${{ inputs.jemalloc-version }}
+        rm -f jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
+
+    # -------------------- Windows (issue #28) --------------------
+    # No transparent preload on Windows: build jemalloc.dll plus a Detours-based
+    # launcher (jemalloc-run.exe) + shim that inject jemalloc into a wrapped
+    # command. The assembled bundle is cached and exposed via the jemalloc-run
+    # output and PATH.
+    - name: "Restore jemalloc (Windows)"
+      if: runner.os == 'Windows'
+      id: cache-jemalloc-win
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.temp }}\jemalloc-dist
+        key: v9-Windows-${{ runner.arch }}-jemalloc-${{ inputs.jemalloc-version }}
+
+    - name: "Set up MSYS2 (Windows)"
+      if: ${{ runner.os == 'Windows' && steps.cache-jemalloc-win.outputs.cache-hit != 'true' }}
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: false
+        install: >-
+          mingw-w64-x86_64-gcc
+          mingw-w64-x86_64-make
+          make
+          autoconf
+          binutils
+          curl
+          tar
+          bzip2
+
+    - name: "Build jemalloc.dll (Windows)"
+      if: ${{ runner.os == 'Windows' && steps.cache-jemalloc-win.outputs.cache-hit != 'true' }}
+      shell: 'msys2 {0}'
+      run: |
+        set -euo pipefail
+        dist="$(cygpath -u "$RUNNER_TEMP")/jemalloc-dist"
+        action="$(cygpath -u "$GITHUB_ACTION_PATH")"
+        mkdir -p "$dist"
+        curl -fLo jemalloc.tar.bz2 https://github.com/jemalloc/jemalloc/releases/download/${{ inputs.jemalloc-version }}/jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
+        bash "$action/scripts/linux/checksums.sh" jemalloc.tar.bz2 "${{ inputs.jemalloc-version }}" "${{ inputs.jemalloc-sha256 }}"
+        tar xf jemalloc.tar.bz2
+        cd jemalloc-${{ inputs.jemalloc-version }}
+        ./configure --disable-cxx
+        make -j"$(nproc)"
+        cp lib/jemalloc.dll "$dist/"
+        cd ..
+        for dep in $(objdump -p "$dist/jemalloc.dll" | awk '/DLL Name:/{print $3}'); do
+          [ -f "/mingw64/bin/$dep" ] && cp "/mingw64/bin/$dep" "$dist/" || true
+        done
+        rm -rf jemalloc-${{ inputs.jemalloc-version }} jemalloc.tar.bz2
+
+    - name: "Set up MSVC (Windows)"
+      if: ${{ runner.os == 'Windows' && steps.cache-jemalloc-win.outputs.cache-hit != 'true' }}
+      uses: ilammy/msvc-dev-cmd@v1
+
+    - name: "Build Detours injector (Windows)"
+      if: ${{ runner.os == 'Windows' && steps.cache-jemalloc-win.outputs.cache-hit != 'true' }}
+      shell: cmd
+      run: |
+        set DIST=%RUNNER_TEMP%\jemalloc-dist
+        set DET=%RUNNER_TEMP%\Detours
+        if exist "%DET%" rmdir /s /q "%DET%"
+        git clone --depth 1 https://github.com/microsoft/Detours "%DET%" || exit /b 1
+        pushd "%DET%" && nmake || (popd & exit /b 1)
+        popd
+        cl /nologo /O2 /MD /EHsc /D_CRT_SECURE_NO_WARNINGS /I "%DET%\include" "%GITHUB_ACTION_PATH%\windows\jemalloc_run.cpp" /Fe:"%DIST%\jemalloc-run.exe" /link "%DET%\lib.X64\detours.lib" || exit /b 1
+        cl /nologo /O2 /MD /EHsc /D_CRT_SECURE_NO_WARNINGS /LD /I "%DET%\include" "%GITHUB_ACTION_PATH%\windows\jemalloc_shim.cpp" /Fe:"%DIST%\jemalloc-shim.dll" /link "%DET%\lib.X64\detours.lib" || exit /b 1
+        del "%DIST%\*.obj" "%DIST%\*.exp" "%DIST%\*.lib" 2>nul
+        dir "%DIST%"
+
+    - name: "Save jemalloc (Windows)"
+      if: ${{ runner.os == 'Windows' && steps.cache-jemalloc-win.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.temp }}\jemalloc-dist
+        key: v9-Windows-${{ runner.arch }}-jemalloc-${{ inputs.jemalloc-version }}
+
+    - name: "Expose jemalloc-run (Windows)"
+      if: runner.os == 'Windows'
+      id: config-win
+      shell: pwsh
+      run: |
+        $dist = "$env:RUNNER_TEMP\jemalloc-dist"
+        Add-Content -Path $env:GITHUB_PATH -Value $dist
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "jemalloc-run=$dist\jemalloc-run.exe"
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "library-path=$dist\jemalloc.dll"
+        if ("${{ steps.cache-jemalloc-win.outputs.cache-hit }}" -eq "true") {
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "cache-hit=true"
+        } else {
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "cache-hit=false"
+        }
+
+    # -------------------- macOS (issue #32) --------------------
+    # DYLD-inserting jemalloc alone does NOT replace malloc on modern macOS, so
+    # build jemalloc + a dyld interposer dylib (macos/jemalloc_interpose.c) that
+    # redirects the CRT allocator to jemalloc's je_*, and insert THAT via
+    # DYLD_INSERT_LIBRARIES. The bundle is relocatable (interposer -> jemalloc
+    # via @loader_path) and cached.
+    - name: "Restore jemalloc (macOS)"
+      if: runner.os == 'macOS'
+      id: cache-jemalloc-mac
+      uses: actions/cache/restore@v6
+      with:
+        path: ${{ runner.temp }}/jemalloc-dist
+        key: v9-macOS-${{ runner.arch }}-jemalloc-${{ inputs.jemalloc-version }}
+
+    - name: "Build jemalloc + interposer (macOS)"
+      if: ${{ runner.os == 'macOS' && steps.cache-jemalloc-mac.outputs.cache-hit != 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        dist="$RUNNER_TEMP/jemalloc-dist"
+        action="$GITHUB_ACTION_PATH"
+        mkdir -p "$dist"
+        curl -fLo jemalloc.tar.bz2 https://github.com/jemalloc/jemalloc/releases/download/${{ inputs.jemalloc-version }}/jemalloc-${{ inputs.jemalloc-version }}.tar.bz2
+        bash "$action/scripts/linux/checksums.sh" jemalloc.tar.bz2 "${{ inputs.jemalloc-version }}" "${{ inputs.jemalloc-sha256 }}"
+        tar xf jemalloc.tar.bz2
+        cd jemalloc-${{ inputs.jemalloc-version }}
+        ./configure --disable-cxx
+        make -j"$(sysctl -n hw.ncpu)"
+        libdir="$PWD/lib"
+        cd ..
+        cp "$libdir"/libjemalloc.2.dylib "$dist/"
+        install_name_tool -id @rpath/libjemalloc.2.dylib "$dist/libjemalloc.2.dylib"
+        cc -O2 -dynamiclib "$action/macos/jemalloc_interpose.c" -o "$dist/jemalloc_interpose.dylib" \
+           -L "$libdir" -ljemalloc -Wl,-rpath,@loader_path
+        dep="$(otool -L "$dist/jemalloc_interpose.dylib" | awk '/libjemalloc\.2\.dylib/{print $1; exit}')"
+        install_name_tool -change "$dep" @loader_path/libjemalloc.2.dylib "$dist/jemalloc_interpose.dylib"
+        otool -L "$dist/jemalloc_interpose.dylib"
+        rm -rf jemalloc-${{ inputs.jemalloc-version }} jemalloc.tar.bz2
+
+    - name: "Save jemalloc (macOS)"
+      if: ${{ runner.os == 'macOS' && steps.cache-jemalloc-mac.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v6
+      with:
+        path: ${{ runner.temp }}/jemalloc-dist
+        key: v9-macOS-${{ runner.arch }}-jemalloc-${{ inputs.jemalloc-version }}
+
+    - name: "Expose the interposer (macOS)"
+      if: runner.os == 'macOS'
+      id: config-mac
+      shell: bash
+      run: |
+        dist="$RUNNER_TEMP/jemalloc-dist"
+        interposer="$dist/jemalloc_interpose.dylib"
+        # We deliberately DO NOT set DYLD_INSERT_LIBRARIES globally (via
+        # $GITHUB_ENV): inserting a malloc interposer into *every* process in a
+        # step can deadlock complex tools (e.g. the compiler) during jemalloc
+        # bootstrap, and SIP would strip it for protected binaries anyway.
+        # Instead, expose the interposer path and wrap the specific command
+        # whose allocations you want served by jemalloc (see README).
+        {
+          echo "interpose-dylib=$interposer"
+          echo "library-path=$dist/libjemalloc.2.dylib"
+        } >> "$GITHUB_OUTPUT"
+        if [ "${{ steps.cache-jemalloc-mac.outputs.cache-hit }}" = "true" ]; then
+          echo "cache-hit=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "cache-hit=false" >> "$GITHUB_OUTPUT"
+        fi
 
 branding:
   icon: "cpu"
   color: "blue"
-
